@@ -7,6 +7,7 @@ module Main where
 
 import Control.Monad.Except
 import Data.Aeson (ToJSON)
+import Data.Functor ((<&>))
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import GHC.Generics
@@ -28,7 +29,8 @@ data Auth = Auth
   } deriving Generic
 instance ToJSON Auth
 
-newtype UserError = UserErrorBadAuth Auth
+data UserError = UserErrorBadAuth Auth
+               | UserErrorNotFound UserId
   deriving Generic
 instance ToJSON UserError
 
@@ -42,30 +44,33 @@ data User = User
   } deriving Generic
 instance ToJSON User
 
-data CurrentUser = CurrentUser
+type UserId = Int
+type Token = Text
+type CurrentUser = (Token, UserId)
 
 data UserRepo m = UserRepo
-  { findUserByAuth :: Auth -> m (Maybe (Int, User))
+  { findUserByAuth :: Auth -> m (Maybe (UserId, User))
   , findUserById   :: Int -> m (Maybe User)
   }
 
-newtype TokenRepo m = TokenRepo { generateToken :: Int -> m Text }
+newtype TokenRepo m = TokenRepo { generateToken :: Int -> m Token }
 newtype Service m = Service
-  { resolveToken :: Text -> m (Either TokenError CurrentUser) }
+  { resolveToken :: Token -> m (Either TokenError CurrentUser) }
 
 main :: IO ()
 main = do
-  userRepo <- undefined
-  tokenRepo <- undefined
-  service <- undefined
+  (userRepo :: UserRepo IO) <- undefined
+  (tokenRepo :: TokenRepo IO) <- undefined
+  (service :: Service IO) <- undefined
   scotty 3000 $ do
     post "/api/users/login" $ do
       auth <- parseJsonBody authForm
-      user <- login userRepo tokenRepo auth >>= either userHandler pure
+      user <- lift (login userRepo tokenRepo auth) >>= either userHandler pure
       json user
     get "/api/user" $ do
-      user <- requireUser service
-      undefined
+      curUser <- requireUser service
+      user <- lift (getUser userRepo curUser) >>= either userHandler pure
+      json user
 
 --
 -- Service code
@@ -79,6 +84,16 @@ login UserRepo{..} TokenRepo{..} auth = findUserByAuth auth >>= \case
     token <- generateToken userId
     return $ Right user { userToken = token }
 
+getUser :: Functor f => UserRepo f -> CurrentUser -> f (Either UserError User)
+getUser UserRepo{..} (token, id) = findUserById id <&> \case
+  Nothing   -> Left $ UserErrorNotFound id
+  Just user -> Right user { userToken = token }
+
+--
+-- Helper functions for Scotty
+--
+--
+
 requireUser :: (Monad m, ScottyError e) => Service m -> ActionT e m CurrentUser
 requireUser service = getCurrentUser service >>= either tokenErrorHandler pure
  where tokenErrorHandler e = status status401 >> json e >> finish
@@ -89,10 +104,6 @@ getCurrentUser Service{..} = header "Authorization" >>= \case
   Nothing        -> return (Left TokenErrorNotFound)
   Just headerVal -> lift $ resolveToken token
    where token = TL.toStrict $ TL.drop 6 headerVal
-
---
--- Helper functions for Scotty
---
 
 parseJsonBody :: (MonadIO m, ScottyError e)
               => DF.Form [Text] m a -> ActionT e m a
