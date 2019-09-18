@@ -1,0 +1,1 @@
+--restart=jwt-scotty.cabal -c cabal new-repl
