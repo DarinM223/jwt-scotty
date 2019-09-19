@@ -2,21 +2,30 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
 import Control.Monad.Except
-import Data.Aeson (ToJSON)
+import Crypto.Random.Types (MonadRandom)
 import Data.Functor ((<&>))
+import Data.List (find)
 import Data.Maybe (isJust)
 import Data.Text (Text)
-import GHC.Generics
+import Data.Text.Encoding (decodeUtf8)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import GHC.Generics (Generic)
+import Jose.Jwa (JwsAlg(RS256))
+import Jose.Jwt
+  ( Payload (Claims), IntDate (IntDate), Jwt (Jwt)
+  , JwtClaims (..), JwtEncoding (JwsEncoding), encode )
 import Network.HTTP.Types.Status
 import Text.Digestive ((.:))
-import Text.Regex
-import TextShow
+import Text.Regex (matchRegex, mkRegexWithOpts)
+import TextShow (showt)
 import Web.Scotty (scotty)
 import Web.Scotty.Trans
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import qualified Text.Digestive.Aeson as DF
@@ -27,22 +36,22 @@ data Auth = Auth
   { authEmail    :: Text
   , authPassword :: Text
   } deriving Generic
-instance ToJSON Auth
+instance Aeson.ToJSON Auth
 
 data UserError = UserErrorBadAuth Auth
                | UserErrorNotFound UserId
   deriving Generic
-instance ToJSON UserError
+instance Aeson.ToJSON UserError
 
 data TokenError = TokenErrorNotFound
   deriving Generic
-instance ToJSON TokenError
+instance Aeson.ToJSON TokenError
 
 data User = User
   { userEmail :: Text
   , userToken :: Text
-  } deriving Generic
-instance ToJSON User
+  } deriving (Show, Generic)
+instance Aeson.ToJSON User
 
 type UserId = Int
 type Token = Text
@@ -53,32 +62,73 @@ data UserRepo m = UserRepo
   , findUserById   :: Int -> m (Maybe User)
   }
 
-newtype TokenRepo m = TokenRepo { generateToken :: Int -> m Token }
-newtype Service m = Service
-  { resolveToken :: Token -> m (Either TokenError CurrentUser) }
+data Tokens m = Tokens
+  { generateToken :: UserId -> m Token
+  , resolveToken  :: Token -> m (Either TokenError CurrentUser)
+  }
 
 main :: IO ()
 main = do
-  (userRepo :: UserRepo IO) <- undefined
-  (tokenRepo :: TokenRepo IO) <- undefined
-  (service :: Service IO) <- undefined
+  let userRepo = userRepoDummy :: UserRepo IO
+  tokens <- tokensIO
   scotty 3000 $ do
     post "/api/users/login" $ do
       auth <- parseJsonBody authForm
-      user <- lift (login userRepo tokenRepo auth) >>= either userHandler pure
+      user <- lift (login userRepo tokens auth) >>= either userHandler pure
       json user
     get "/api/user" $ do
-      curUser <- requireUser service
+      curUser <- requireUser tokens
       user <- lift (getUser userRepo curUser) >>= either userHandler pure
       json user
+
+--
+-- "Instances" for records of functions.
+--
+
+userRepoDummy :: Monad m => UserRepo m
+userRepoDummy = UserRepo
+  { findUserByAuth = \auth ->
+    -- NOTE: Doesn't check password, since this is dummy example.
+    return $ find ((== authEmail auth) . userEmail . snd) users
+  , findUserById = \id -> return $ lookup id users
+  }
+ where
+  users = [ (0, User { userEmail = "bob@gmail.com", userToken = "" })
+          , (1, User { userEmail = "foo@gmail.com", userToken = "" }) ]
+
+tokensIO :: (MonadIO m, MonadRandom m) => m (Tokens m)
+tokensIO = do
+  parsed <- Aeson.eitherDecodeStrict <$> liftIO (BS.readFile "secrets/jwk.sig")
+  let jwks           = either (error . ("Invalid JWK file: " <>)) pure parsed
+      expirationSecs = 2 * 60 * 60
+  return Tokens { generateToken = generateToken' jwks expirationSecs
+                , resolveToken  = resolveToken' jwks
+                }
+ where
+  generateToken' jwks expirationSecs uid = do
+    curTime <- liftIO getPOSIXTime
+    let claim = JwtClaims { jwtIss = Nothing
+                          , jwtSub = Just $ showt uid
+                          , jwtAud = Nothing
+                          , jwtExp = Just $ IntDate $ curTime + expirationSecs
+                          , jwtNbf = Nothing
+                          , jwtIat = Nothing
+                          , jwtJti = Nothing
+                          }
+        claimStr = BSL.toStrict $ Aeson.encode claim
+    (Jwt encoded) <- either (error . ("Failed to encode JWT: " <>) . show) id
+                 <$> encode jwks (JwsEncoding RS256) (Claims claimStr)
+    return $ decodeUtf8 encoded
+  resolveToken' jwks token = do
+    curTime <- liftIO getPOSIXTime
+    undefined
 
 --
 -- Service code
 --
 
-login :: Monad m
-      => UserRepo m -> TokenRepo m -> Auth -> m (Either UserError User)
-login UserRepo{..} TokenRepo{..} auth = findUserByAuth auth >>= \case
+login :: Monad m => UserRepo m -> Tokens m -> Auth -> m (Either UserError User)
+login UserRepo{..} Tokens{..} auth = findUserByAuth auth >>= \case
   Nothing             -> return $ Left (UserErrorBadAuth auth)
   Just (userId, user) -> do
     token <- generateToken userId
@@ -92,16 +142,15 @@ getUser UserRepo{..} (token, id) = findUserById id <&> \case
 --
 -- Helper functions for Scotty
 --
---
 
-requireUser :: (Monad m, ScottyError e) => Service m -> ActionT e m CurrentUser
-requireUser service = getCurrentUser service >>= either tokenErrorHandler pure
+requireUser :: (Monad m, ScottyError e) => Tokens m -> ActionT e m CurrentUser
+requireUser toks = getCurrentUser toks >>= either tokenErrorHandler pure
  where tokenErrorHandler e = status status401 >> json e >> finish
 
 getCurrentUser :: (Monad m, ScottyError e)
-               => Service m -> ActionT e m (Either TokenError CurrentUser)
-getCurrentUser Service{..} = header "Authorization" >>= \case
-  Nothing        -> return (Left TokenErrorNotFound)
+               => Tokens m -> ActionT e m (Either TokenError CurrentUser)
+getCurrentUser Tokens{..} = header "Authorization" >>= \case
+  Nothing        -> return $ Left TokenErrorNotFound
   Just headerVal -> lift $ resolveToken token
    where token = TL.toStrict $ TL.drop 6 headerVal
 

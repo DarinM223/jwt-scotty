@@ -23,6 +23,8 @@ executable jwt-scotty
   -- other-extensions:
   build-depends:       base >=4.12 && <5
                      , aeson
+                     , bytestring
+                     , cryptonite
                      , digestive-functors
                      , digestive-functors-aeson
                      , http-types
@@ -32,6 +34,7 @@ executable jwt-scotty
                      , scotty
                      , text
                      , text-show
+                     , time
   hs-source-dirs:      src
   ghc-options: -W
                -Wcompat
