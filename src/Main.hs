@@ -6,19 +6,21 @@ module Main where
 
 import Control.Monad.Except
 import Crypto.Random.Types (MonadRandom)
+import Data.Bifunctor (first)
 import Data.Functor ((<&>))
 import Data.List (find)
-import Data.Maybe (isJust)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
-import Data.Text.Encoding (decodeUtf8)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Generics (Generic)
 import Jose.Jwa (JwsAlg(RS256))
 import Jose.Jwt
-  ( Payload (Claims), IntDate (IntDate), Jwt (Jwt)
-  , JwtClaims (..), JwtEncoding (JwsEncoding), encode )
+  ( Payload (Claims), IntDate (IntDate), Jwt (Jwt), JwtClaims (..)
+  , JwtContent (Jws), JwtEncoding (JwsEncoding), decode, encode )
 import Network.HTTP.Types.Status
 import Text.Digestive ((.:))
+import Text.Read (readMaybe)
 import Text.Regex (matchRegex, mkRegexWithOpts)
 import TextShow (showt)
 import Web.Scotty (scotty)
@@ -44,6 +46,9 @@ data UserError = UserErrorBadAuth Auth
 instance Aeson.ToJSON UserError
 
 data TokenError = TokenErrorNotFound
+                | TokenErrorMalformed String
+                | TokenErrorExpired
+                | TokenErrorUserIdNotFound
   deriving Generic
 instance Aeson.ToJSON TokenError
 
@@ -121,7 +126,20 @@ tokensIO = do
     return $ decodeUtf8 encoded
   resolveToken' jwks token = do
     curTime <- liftIO getPOSIXTime
-    undefined
+    eitherJwt <- decode jwks (Just (JwsEncoding RS256)) (encodeUtf8 token)
+    return $ do
+      jwt <- first (TokenErrorMalformed . show) eitherJwt
+      claimsRaw <- case jwt of
+        Jws (_, claimsRaw) -> Right claimsRaw
+        _                  -> Left $ TokenErrorMalformed "Not Jws"
+      jwtClaims <- first TokenErrorMalformed
+                 $ Aeson.eitherDecode $ BSL.fromStrict claimsRaw
+      let (IntDate expiredAt) = fromMaybe (IntDate curTime) $ jwtExp jwtClaims
+      when (expiredAt < curTime) $ Left TokenErrorExpired
+      userId <- maybe (Left TokenErrorUserIdNotFound) Right
+              $ jwtSub jwtClaims >>= readMay
+      return (token, userId)
+  readMay = readMaybe . T.unpack
 
 --
 -- Service code
