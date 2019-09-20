@@ -170,7 +170,7 @@ getCurrentUser :: (Monad m, ScottyError e)
 getCurrentUser Tokens{..} = header "Authorization" >>= \case
   Nothing        -> return $ Left TokenErrorNotFound
   Just headerVal -> lift $ resolveToken token
-   where token = TL.toStrict $ TL.drop 6 headerVal
+   where token = T.strip $ TL.toStrict $ TL.drop 6 headerVal
 
 parseJsonBody :: (MonadIO m, ScottyError e)
               => DF.Form [Text] m a -> ActionT e m a
